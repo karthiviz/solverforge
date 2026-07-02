@@ -27,6 +27,11 @@ pub struct ListPrecedenceMakespanConstraint<S> {
     node_release_time: Option<fn(&S, NodeId) -> i64>,
     pin_target: Option<fn(&S, NodeId) -> Option<i64>>,
     disruption_baseline: Option<fn(&S, NodeId) -> Option<i64>>,
+    // ── Dock deadline (Slice 3 Task 7) — per-node due-time (HARD) + storage-floor (SOFT), read
+    // once alongside release/pin/disruption and folded into the SAME timing pass, but scored off
+    // `finishes[node]` (the completion time) rather than `earliest[node]`. Absent ⇒ no-op.
+    node_due_time: Option<fn(&S, NodeId) -> i64>,
+    storage_floor: Option<fn(&S, NodeId) -> Option<i64>>,
     state: Option<ListPrecedenceState>,
     _phantom: PhantomData<fn() -> S>,
 }
@@ -56,6 +61,8 @@ impl<S> ListPrecedenceMakespanConstraint<S> {
             node_release_time: None,
             pin_target: None,
             disruption_baseline: None,
+            node_due_time: None,
+            storage_floor: None,
             state: None,
             _phantom: PhantomData,
         }
@@ -92,6 +99,23 @@ impl<S> ListPrecedenceMakespanConstraint<S> {
         self
     }
 
+    /// Dock deadline (Task 7) — HARD due-time term: for each node with a due `D`, penalize the
+    /// overshoot `max(0, finish[n] − D)`. Computed from the incrementally-maintained `finishes[n]`,
+    /// so search sees correct deadline deltas. A due always applies to every node once attached;
+    /// a large `D` (or a terminal-only meaning) is a no-op for nodes that finish in time.
+    pub fn with_node_due_time(mut self, due: fn(&S, NodeId) -> i64) -> Self {
+        self.node_due_time = Some(due);
+        self
+    }
+
+    /// Dock deadline (Task 7) — SOFT storage-floor term: for each node with `floor(s, n) == Some(F)`,
+    /// add `max(0, F − finish[n])` to the soft penalty (alongside makespan/disruption). Drives search
+    /// away from finishing before dock storage is available. Computed from the same `finishes[n]`.
+    pub fn with_node_storage_floor(mut self, floor: fn(&S, NodeId) -> Option<i64>) -> Self {
+        self.storage_floor = Some(floor);
+        self
+    }
+
     fn build_state(&self, solution: &S) -> ListPrecedenceState {
         let node_count = (self.node_count)(solution);
         let owner_count = (self.list_owner_count)(solution);
@@ -122,6 +146,8 @@ impl<S> ListPrecedenceMakespanConstraint<S> {
         if self.node_release_time.is_some()
             || self.pin_target.is_some()
             || self.disruption_baseline.is_some()
+            || self.node_due_time.is_some()
+            || self.storage_floor.is_some()
         {
             let release = (0..node_count)
                 .map(|n| self.node_release_time.map_or(0, |f| f(solution, n)))
@@ -132,7 +158,15 @@ impl<S> ListPrecedenceMakespanConstraint<S> {
             let baseline = (0..node_count)
                 .map(|n| self.disruption_baseline.and_then(|f| f(solution, n)))
                 .collect();
-            state.set_pin_terms(release, pin, baseline);
+            // Dock deadline (Task 7): due present-for-all-nodes-once-attached (Some sentinel);
+            // floor is naturally per-node optional.
+            let due = (0..node_count)
+                .map(|n| self.node_due_time.map(|f| f(solution, n)))
+                .collect();
+            let floor = (0..node_count)
+                .map(|n| self.storage_floor.and_then(|f| f(solution, n)))
+                .collect();
+            state.set_pin_terms(release, pin, baseline, due, floor);
         }
 
         state.refresh_score_full();
@@ -267,6 +301,9 @@ struct ListPrecedenceState {
     release: Vec<i64>,
     pin: Vec<Option<i64>>,
     disruption_baseline: Vec<Option<i64>>,
+    // Dock deadline (Task 7) — per-node due (HARD) + storage-floor (SOFT). Default no-op: None.
+    due: Vec<Option<i64>>,
+    floor: Vec<Option<i64>>,
 }
 
 #[derive(Default)]
@@ -347,6 +384,8 @@ impl ListPrecedenceState {
             release: vec![0; node_count],
             pin: vec![None; node_count],
             disruption_baseline: vec![None; node_count],
+            due: vec![None; node_count],
+            floor: vec![None; node_count],
         }
     }
 
@@ -358,10 +397,14 @@ impl ListPrecedenceState {
         release: Vec<i64>,
         pin: Vec<Option<i64>>,
         disruption_baseline: Vec<Option<i64>>,
+        due: Vec<Option<i64>>,
+        floor: Vec<Option<i64>>,
     ) {
         self.release = release;
         self.pin = pin;
         self.disruption_baseline = disruption_baseline;
+        self.due = due;
+        self.floor = floor;
     }
 
     fn add_edge(&mut self, edge: Edge) -> bool {
@@ -568,9 +611,13 @@ impl ListPrecedenceState {
         // guarantees. Gated on an ACYCLIC graph: in a cyclic (infeasible) state `earliest[n]` is
         // meaningless and the cache/full paths diverge, so the terms are suppressed and the
         // dominating `cycle_penalty` carries the hard signal (keeps incremental == fresh exactly).
-        let (pin_penalty, disruption) = if self.cycle_penalty == 0 {
+        let (pin_penalty, disruption, hard_deadline, soft_floor) = if self.cycle_penalty == 0 {
             let mut pin_penalty = 0i64;
             let mut disruption = 0i64;
+            // Dock deadline (Task 7): due (HARD) + storage-floor (SOFT), read off the SAME timing
+            // pass but from `finishes[node]` (completion) rather than `earliest[node]` (start).
+            let mut hard_deadline = 0i64;
+            let mut soft_floor = 0i64;
             for node in 0..self.node_count {
                 if let Some(target) = self.pin[node] {
                     pin_penalty = pin_penalty.saturating_add((self.earliest[node] - target).abs());
@@ -578,14 +625,27 @@ impl ListPrecedenceState {
                 if let Some(baseline) = self.disruption_baseline[node] {
                     disruption = disruption.saturating_add((self.earliest[node] - baseline).abs());
                 }
+                if let Some(due) = self.due[node] {
+                    hard_deadline =
+                        hard_deadline.saturating_add((self.finishes[node] - due).max(0));
+                }
+                if let Some(floor) = self.floor[node] {
+                    soft_floor = soft_floor.saturating_add((floor - self.finishes[node]).max(0));
+                }
             }
-            (pin_penalty, disruption)
+            (pin_penalty, disruption, hard_deadline, soft_floor)
         } else {
-            (0, 0)
+            (0, 0, 0, 0)
         };
 
-        let hard = (-usize_to_i64(hard_penalty)).saturating_sub(pin_penalty);
-        let soft = self.makespan.saturating_neg().saturating_sub(disruption);
+        let hard = (-usize_to_i64(hard_penalty))
+            .saturating_sub(pin_penalty)
+            .saturating_sub(hard_deadline);
+        let soft = self
+            .makespan
+            .saturating_neg()
+            .saturating_sub(disruption)
+            .saturating_sub(soft_floor);
         self.score = HardSoftScore::of(hard, soft);
         self.score
     }
@@ -1506,6 +1566,68 @@ mod f2_fork_tests {
         assert_eq!(soft_a, -30, "zero-disruption layout: soft = -makespan(30) - 0");
         assert_eq!(soft_b, -50, "disrupted layout: soft = -makespan(30) - Σ|Δ|(20)");
         assert!(soft_a > soft_b, "search now has a disruption gradient (A outranks B on soft)");
+    }
+
+    /// Dock deadline (Task 7) — HARD due-time term. A single terminal op finishes at 10; due 5
+    /// (< 10) is UNREACHABLE ⇒ hard = -(|finish − due|.max(0)) = -5. Mirrors
+    /// `f2_unreachable_earlier_pin_scores_negative_hard` but reads `finishes[node]`, not `earliest`.
+    #[test]
+    fn f2_due_time_violation_scores_negative_hard() {
+        let plan = PinPlan {
+            tasks: vec![task(10, None, 0, 0, None, None)], // op0 dur 10 → finish 10
+            routes: vec![PinRoute { tasks: vec![0] }],
+            score: None,
+        };
+        let score = f2_constraint_no_owner()
+            .with_node_due_time(|_p, _n| 5)
+            .evaluate(&plan);
+        assert_eq!(score.hard(), -5, "past-due terminal: hard = -((10 - 5).max(0)) = -5");
+    }
+
+    /// Dock storage-floor (Task 7) — SOFT, non-blind. Three independent ops on one machine with a
+    /// per-op floor [30,20,10]; two orderings give DIFFERENT terminal finishes ⇒ different SOFT
+    /// scores. Mirrors `f2_lower_disruption_outscores_higher_on_soft`, reading `finishes[node]`.
+    #[test]
+    fn f2_storage_floor_is_soft_and_nonblind() {
+        let make = |seq: Vec<usize>| PinPlan {
+            tasks: vec![
+                task(10, None, 0, 0, None, None),
+                task(10, None, 0, 0, None, None),
+                task(10, None, 0, 0, None, None),
+            ],
+            routes: vec![PinRoute { tasks: seq }],
+            score: None,
+        };
+        let floors = |_p: &PinPlan, n: usize| Some([30i64, 20, 10][n]);
+        // Layout A = [2,1,0] → finishes op0=30,op1=20,op2=10 → Σmax(0,floor−finish)=0 → soft = -30.
+        let soft_a = f2_constraint_no_owner()
+            .with_node_storage_floor(floors)
+            .evaluate(&make(vec![2, 1, 0]))
+            .soft();
+        // Layout B = [0,1,2] → finishes op0=10,op1=20,op2=30 → 20+0+0=20 → soft = -50.
+        let soft_b = f2_constraint_no_owner()
+            .with_node_storage_floor(floors)
+            .evaluate(&make(vec![0, 1, 2]))
+            .soft();
+        assert_eq!(soft_a, -30, "floor-satisfying layout: soft = -makespan(30) - 0");
+        assert_eq!(soft_b, -50, "floor-violating layout: soft = -makespan(30) - 20");
+        assert!(soft_a > soft_b, "search now has a storage-floor gradient (A outranks B on soft)");
+    }
+
+    /// Default no-op: with NO due/floor builder attached (release/pin/disruption still wired but
+    /// inert on this data), the score is byte-identical to stock — makespan 20, zero penalties.
+    #[test]
+    fn f2_due_and_floor_absent_identical_to_stock() {
+        let plan = PinPlan {
+            tasks: vec![
+                task(10, None, 0, 0, None, None),
+                task(10, None, 0, 0, None, None),
+            ],
+            routes: vec![PinRoute { tasks: vec![0, 1] }],
+            score: None,
+        };
+        // No with_node_due_time / with_node_storage_floor ⇒ due/floor terms inert.
+        assert_eq!(f2_constraint_no_owner().evaluate(&plan), HardSoftScore::of(0, -20));
     }
 
     // Same as `f2_constraint` but without `with_expected_owner`, for single-owner fixtures where
