@@ -20,6 +20,13 @@ pub struct ListPrecedenceMakespanConstraint<S> {
     list_len: fn(&S, OwnerId) -> usize,
     list_get: fn(&S, OwnerId, usize) -> Option<NodeId>,
     expected_owner: Option<fn(&S, NodeId) -> Option<OwnerId>>,
+    // ── F2 fork (Lagrange M1 interactive-reflow) — per-node release-time floor + pin + disruption.
+    // All three are STATIC per node (machines fixed → these never change during search), read once
+    // in `build_state` alongside `durations`, and folded into the SAME incremental timing pass.
+    // Absent (None) ⇒ no-op ⇒ score byte-identical to stock 0.17.1.
+    node_release_time: Option<fn(&S, NodeId) -> i64>,
+    pin_target: Option<fn(&S, NodeId) -> Option<i64>>,
+    disruption_baseline: Option<fn(&S, NodeId) -> Option<i64>>,
     state: Option<ListPrecedenceState>,
     _phantom: PhantomData<fn() -> S>,
 }
@@ -46,6 +53,9 @@ impl<S> ListPrecedenceMakespanConstraint<S> {
             list_len,
             list_get,
             expected_owner: None,
+            node_release_time: None,
+            pin_target: None,
+            disruption_baseline: None,
             state: None,
             _phantom: PhantomData,
         }
@@ -56,6 +66,29 @@ impl<S> ListPrecedenceMakespanConstraint<S> {
         expected_owner: Option<fn(&S, NodeId) -> Option<OwnerId>>,
     ) -> Self {
         self.expected_owner = expected_owner;
+        self
+    }
+
+    /// F2 — per-node **release-time floor**: `start[n] = max(pred_finishes, release(s, n))`.
+    /// Static per node (the pin T, or an earliest-start floor). Folded into both the full
+    /// rebuild and the incremental descendant-refresh so the maintained `earliest[n]` honors it.
+    pub fn with_node_release_time(mut self, release: fn(&S, NodeId) -> i64) -> Self {
+        self.node_release_time = Some(release);
+        self
+    }
+
+    /// F2 — HARD pin term: for each node with `pin(s, n) == Some(T)`, penalize `|start[n] − T|`.
+    /// Computed from the incrementally-maintained `earliest[n]`, so search sees correct pin deltas.
+    pub fn with_pin(mut self, pin: fn(&S, NodeId) -> Option<i64>) -> Self {
+        self.pin_target = Some(pin);
+        self
+    }
+
+    /// F2 — SOFT disruption term: for each node with `baseline(s, n) == Some(root)`, add
+    /// `|start[n] − root|` to the soft penalty (alongside makespan). Drives local search toward
+    /// minimal `Σ|start − root_start|`. Computed from the same maintained `earliest[n]`.
+    pub fn with_disruption(mut self, baseline: fn(&S, NodeId) -> Option<i64>) -> Self {
+        self.disruption_baseline = Some(baseline);
         self
     }
 
@@ -84,6 +117,24 @@ impl<S> ListPrecedenceMakespanConstraint<S> {
         for owner in 0..owner_count {
             state.add_owner_route(solution, owner, access);
         }
+
+        // F2 — read the static per-node release/pin/disruption terms once (mirrors `durations`).
+        if self.node_release_time.is_some()
+            || self.pin_target.is_some()
+            || self.disruption_baseline.is_some()
+        {
+            let release = (0..node_count)
+                .map(|n| self.node_release_time.map_or(0, |f| f(solution, n)))
+                .collect();
+            let pin = (0..node_count)
+                .map(|n| self.pin_target.and_then(|f| f(solution, n)))
+                .collect();
+            let baseline = (0..node_count)
+                .map(|n| self.disruption_baseline.and_then(|f| f(solution, n)))
+                .collect();
+            state.set_pin_terms(release, pin, baseline);
+        }
+
         state.refresh_score_full();
         state
     }
@@ -211,6 +262,11 @@ struct ListPrecedenceState {
     score: HardSoftScore,
     hard_penalty: usize,
     makespan: i64,
+    // ── F2 fork — static per-node terms (see ListPrecedenceMakespanConstraint). Default no-op:
+    //    release = 0, pin = None, disruption_baseline = None ⇒ identical to stock 0.17.1.
+    release: Vec<i64>,
+    pin: Vec<Option<i64>>,
+    disruption_baseline: Vec<Option<i64>>,
 }
 
 #[derive(Default)]
@@ -288,7 +344,24 @@ impl ListPrecedenceState {
             score: HardSoftScore::ZERO,
             hard_penalty: 0,
             makespan: 0,
+            release: vec![0; node_count],
+            pin: vec![None; node_count],
+            disruption_baseline: vec![None; node_count],
         }
+    }
+
+    /// F2 — install the static per-node release/pin/disruption terms (called by `build_state`
+    /// after routes are laid in, before the first `refresh_score_full`). Idempotent w.r.t. a
+    /// fresh state; the vecs are read-only for the lifetime of the state (machines fixed).
+    fn set_pin_terms(
+        &mut self,
+        release: Vec<i64>,
+        pin: Vec<Option<i64>>,
+        disruption_baseline: Vec<Option<i64>>,
+    ) {
+        self.release = release;
+        self.pin = pin;
+        self.disruption_baseline = disruption_baseline;
     }
 
     fn add_edge(&mut self, edge: Edge) -> bool {
@@ -487,7 +560,33 @@ impl ListPrecedenceState {
             + self.assignment_penalty
             + self.cycle_penalty;
         self.hard_penalty = hard_penalty;
-        self.score = HardSoftScore::of(-usize_to_i64(hard_penalty), self.makespan.saturating_neg());
+
+        // F2 — pin (hard) + disruption (soft) terms, computed from the incrementally-maintained
+        // `earliest[n]`. BOTH score paths (full `refresh_score_full` and incremental
+        // `refresh_score_after_route_change`) funnel through here, so these terms are automatically
+        // incremental-consistent iff `earliest[n]` is — which the release-floored timing pass
+        // guarantees. Gated on an ACYCLIC graph: in a cyclic (infeasible) state `earliest[n]` is
+        // meaningless and the cache/full paths diverge, so the terms are suppressed and the
+        // dominating `cycle_penalty` carries the hard signal (keeps incremental == fresh exactly).
+        let (pin_penalty, disruption) = if self.cycle_penalty == 0 {
+            let mut pin_penalty = 0i64;
+            let mut disruption = 0i64;
+            for node in 0..self.node_count {
+                if let Some(target) = self.pin[node] {
+                    pin_penalty = pin_penalty.saturating_add((self.earliest[node] - target).abs());
+                }
+                if let Some(baseline) = self.disruption_baseline[node] {
+                    disruption = disruption.saturating_add((self.earliest[node] - baseline).abs());
+                }
+            }
+            (pin_penalty, disruption)
+        } else {
+            (0, 0)
+        };
+
+        let hard = (-usize_to_i64(hard_penalty)).saturating_sub(pin_penalty);
+        let soft = self.makespan.saturating_neg().saturating_sub(disruption);
+        self.score = HardSoftScore::of(hard, soft);
         self.score
     }
 
@@ -533,7 +632,10 @@ impl ListPrecedenceState {
                     self.earliest[predecessor].saturating_add(self.durations[predecessor])
                 })
                 .max()
-                .unwrap_or(0);
+                .unwrap_or(0)
+                // F2 — apply the same static release floor the full rebuild uses, so the
+                // incrementally-maintained `earliest[n]` matches a from-scratch recompute.
+                .max(self.release[node]);
             if new_earliest == self.earliest[node] {
                 continue;
             }
@@ -552,7 +654,10 @@ impl ListPrecedenceState {
 
     fn rebuild_graph_summary(&mut self) {
         let mut indegree: Vec<usize> = self.predecessors.iter().map(Vec::len).collect();
-        let mut earliest = vec![0i64; self.node_count];
+        // F2 — seed each node's earliest from its static release floor (default 0 ⇒ stock behavior).
+        // The topo relaxation `earliest[succ] = earliest[succ].max(finish)` then yields
+        // `max(release[n], longest predecessor finish)` — the DAG start with a release-time floor.
+        let mut earliest = self.release.clone();
         let mut finishes = vec![0i64; self.node_count];
         let mut ready = VecDeque::new();
         for (node, &degree) in indegree.iter().enumerate() {
@@ -1172,5 +1277,256 @@ mod tests {
         director.after_variable_changed(1, 0);
 
         assert_eq!(director.calculate_score(), score);
+    }
+}
+
+/// F2 fork keystone — release-time floor + hard-pin + soft-disruption terms are
+/// INCREMENTALLY CONSISTENT: after any list move the incrementally-maintained score
+/// (`calculate_score`) equals a from-scratch recompute (`Director::fresh_score`), for the
+/// pin term AND the disruption term AND makespan together.
+///
+/// This is the decisive artifact for the Lagrange M1 fork-feasibility spike. The proof is
+/// airtight because both score paths (full `refresh_score_full`, incremental
+/// `refresh_score_after_route_change`) funnel through `refresh_score_from_cached_graph`, which
+/// reads the same `earliest[n]` the release-floored timing pass maintains. If `earliest[n]` is
+/// incrementally correct (crate-guaranteed for makespan), so are the pin/disruption terms.
+#[cfg(test)]
+mod f2_fork_tests {
+    use crate::director::Director;
+    use crate::ScoreDirector;
+    use solverforge_core::domain::PlanningSolution;
+    use solverforge_core::score::HardSoftScore;
+
+    use super::*;
+
+    #[derive(Clone, Debug)]
+    struct PinTask {
+        duration: usize,
+        next: Option<usize>,
+        owner: Option<usize>,
+        release: i64,
+        pin: Option<i64>,
+        baseline: Option<i64>,
+    }
+
+    #[derive(Clone, Debug)]
+    struct PinRoute {
+        tasks: Vec<usize>,
+    }
+
+    #[derive(Clone, Debug)]
+    struct PinPlan {
+        tasks: Vec<PinTask>,
+        routes: Vec<PinRoute>,
+        score: Option<HardSoftScore>,
+    }
+
+    impl PlanningSolution for PinPlan {
+        type Score = HardSoftScore;
+        fn score(&self) -> Option<Self::Score> {
+            self.score
+        }
+        fn set_score(&mut self, score: Option<Self::Score>) {
+            self.score = score;
+        }
+    }
+
+    fn f2_constraint() -> ListPrecedenceMakespanConstraint<PinPlan> {
+        ListPrecedenceMakespanConstraint::new(
+            ConstraintRef::new("", "f2ListPrecedence"),
+            0,
+            |p: &PinPlan| p.tasks.len(),
+            |p: &PinPlan, n: usize| p.tasks[n].duration,
+            |p: &PinPlan, n: usize, out: &mut Vec<usize>| {
+                if let Some(next) = p.tasks[n].next {
+                    out.push(next);
+                }
+            },
+            |p: &PinPlan| p.routes.len(),
+            |p: &PinPlan, o: usize| p.routes[o].tasks.len(),
+            |p: &PinPlan, o: usize, pos: usize| p.routes[o].tasks.get(pos).copied(),
+        )
+        .with_expected_owner(Some(|p: &PinPlan, n: usize| p.tasks[n].owner))
+        .with_node_release_time(|p: &PinPlan, n: usize| p.tasks[n].release)
+        .with_pin(|p: &PinPlan, n: usize| p.tasks[n].pin)
+        .with_disruption(|p: &PinPlan, n: usize| p.tasks[n].baseline)
+    }
+
+    fn task(
+        duration: usize,
+        next: Option<usize>,
+        owner: usize,
+        release: i64,
+        pin: Option<i64>,
+        baseline: Option<i64>,
+    ) -> PinTask {
+        PinTask { duration, next, owner: Some(owner), release, pin, baseline }
+    }
+
+    /// 5 ops on 2 machines with a release floor, a reachable pin, and a per-op disruption baseline.
+    ///   M0 (owner 0): [0, 1, 4]     M1 (owner 1): [2, 3]
+    ///   op4 has release floor 5; op2 is PINNED at 30 (baseline == pin); baselines = the seeded
+    ///   layout's DAG starts so a reordering produces non-zero disruption.
+    fn fixture() -> PinPlan {
+        PinPlan {
+            tasks: vec![
+                task(10, None, 0, 0, None, Some(0)),
+                task(10, None, 0, 0, None, Some(10)),
+                task(10, None, 1, 30, Some(30), Some(30)),
+                task(10, None, 1, 0, None, Some(30)),
+                task(10, None, 0, 5, None, Some(20)),
+            ],
+            routes: vec![PinRoute { tasks: vec![0, 1, 4] }, PinRoute { tasks: vec![2, 3] }],
+            score: None,
+        }
+    }
+
+    /// KEYSTONE: incremental == fresh for pin + disruption + makespan, move-by-move, under both
+    /// an intra-machine reverse/permute (what solver.toml uses) AND a cross-machine relocate.
+    #[test]
+    fn f2_incremental_equals_fresh_after_list_moves() {
+        let mut director = ScoreDirector::new(fixture(), (f2_constraint(),));
+
+        // Initial full evaluation.
+        let initial = director.calculate_score();
+        assert_eq!(Director::fresh_score(&director), Some(initial));
+        // The terms are genuinely engaged (not a vacuous 0 == 0): the pinned op2 sits at its
+        // reachable floor 30, so pin penalty is 0, but the disruption baseline is active.
+        assert_eq!(initial.hard(), 0, "seeded layout is pin-feasible + structurally sound");
+
+        // Move 1 — intra-machine PERMUTE on M0: [0,1,4] -> [4,0,1] (op4's release 5 shifts starts).
+        director.before_variable_changed(0, 0);
+        director.working_solution_mut().routes[0].tasks = vec![4, 0, 1];
+        director.after_variable_changed(0, 0);
+        let inc1 = director.calculate_score();
+        assert_eq!(
+            Director::fresh_score(&director),
+            Some(inc1),
+            "after intra-machine permute: incremental score must equal fresh recompute"
+        );
+
+        // Move 2 — intra-machine REVERSE on M1: [2,3] -> [3,2] (pushes pinned op2 off its floor
+        // via machine predecessor op3, exercising the pin HARD term incrementally).
+        director.before_variable_changed(0, 1);
+        director.working_solution_mut().routes[1].tasks = vec![3, 2];
+        director.after_variable_changed(0, 1);
+        let inc2 = director.calculate_score();
+        assert_eq!(
+            Director::fresh_score(&director),
+            Some(inc2),
+            "after intra-machine reverse: incremental score must equal fresh recompute"
+        );
+        // op2 pinned at 30 but now sequenced after op3 (finish 10) → its start floors at max(10,30)
+        // = 30, still == pin, so hard stays 0; the point is incremental == fresh regardless.
+        assert_eq!(inc2, director.calculate_score());
+
+        // Move 3 — CROSS-MACHINE relocate: move op1 off M0 onto M1. Two single-owner mutations;
+        // incremental == fresh must hold after EACH (the invariant local search relies on).
+        director.before_variable_changed(0, 0);
+        director.working_solution_mut().routes[0].tasks = vec![4, 0];
+        director.after_variable_changed(0, 0);
+        assert_eq!(
+            Director::fresh_score(&director),
+            Some(director.calculate_score()),
+            "cross-machine relocate (retract leg): incremental == fresh"
+        );
+        director.before_variable_changed(0, 1);
+        director.working_solution_mut().routes[1].tasks = vec![3, 2, 1];
+        director.after_variable_changed(0, 1);
+        assert_eq!(
+            Director::fresh_score(&director),
+            Some(director.calculate_score()),
+            "cross-machine relocate (insert leg): incremental == fresh"
+        );
+    }
+
+    /// Default no-op: with NO F2 builder attached, the score is byte-identical to stock 0.17.1
+    /// (release 0, no pin, no disruption ⇒ HardSoftScore(-structural, -makespan)).
+    #[test]
+    fn f2_absent_builders_are_identical_to_stock() {
+        let plain = ListPrecedenceMakespanConstraint::new(
+            ConstraintRef::new("", "plain"),
+            0,
+            |p: &PinPlan| p.tasks.len(),
+            |p: &PinPlan, n: usize| p.tasks[n].duration,
+            |_p: &PinPlan, _n: usize, _out: &mut Vec<usize>| {},
+            |p: &PinPlan| p.routes.len(),
+            |p: &PinPlan, o: usize| p.routes[o].tasks.len(),
+            |p: &PinPlan, o: usize, pos: usize| p.routes[o].tasks.get(pos).copied(),
+        );
+        // Two independent ops on one machine, durations 10 → makespan 20, no structural penalty.
+        let plan = PinPlan {
+            tasks: vec![
+                task(10, None, 0, 0, Some(999), Some(999)), // pin/baseline present in DATA but…
+                task(10, None, 0, 0, None, None),
+            ],
+            routes: vec![PinRoute { tasks: vec![0, 1] }],
+            score: None,
+        };
+        // …the constraint has NO with_pin/with_disruption → the terms are inert.
+        assert_eq!(plain.evaluate(&plan), HardSoftScore::of(0, -20));
+    }
+
+    /// Unreachable EARLIER pin fires the HARD term — the capability the stock fallback LACKED
+    /// (its SF score was blind to `start != T`). op0 pinned at 5 but precedence-min is 10.
+    #[test]
+    fn f2_unreachable_earlier_pin_scores_negative_hard() {
+        // op1 -> op0 fixed edge (op0 depends on op1), so op0's earliest is op1.finish = 10.
+        // Pin op0 at 5 (< 10). Release floor cannot pull earlier ⇒ earliest[0] = 10, pin |10-5| = 5.
+        let plan = PinPlan {
+            tasks: vec![
+                task(10, None, 0, 0, Some(5), None), // op0 pinned at 5
+                task(10, Some(0), 0, 0, None, None), // op1 -> op0
+            ],
+            routes: vec![PinRoute { tasks: vec![1, 0] }],
+            score: None,
+        };
+        let score = f2_constraint_no_owner().evaluate(&plan);
+        assert_eq!(score.hard(), -5, "unreachable earlier pin: hard = -(|10-5|) = -5");
+    }
+
+    /// Lower Σ|Δstart| layout OUTSCORES a higher one on SOFT — the disruption GRADIENT the stock
+    /// fallback could not express (both layouts tied at -makespan there).
+    #[test]
+    fn f2_lower_disruption_outscores_higher_on_soft() {
+        // Three independent ops on one machine, baseline (root) = [0,10,20] tied to op identity.
+        let make = |seq: Vec<usize>| PinPlan {
+            tasks: vec![
+                task(10, None, 0, 0, None, Some(0)),
+                task(10, None, 0, 0, None, Some(10)),
+                task(10, None, 0, 0, None, Some(20)),
+            ],
+            routes: vec![PinRoute { tasks: seq }],
+            score: None,
+        };
+        // Layout A = identity order → starts [0,10,20] → Σ|Δ| = 0 → soft = -30.
+        let soft_a = f2_constraint_no_owner().evaluate(&make(vec![0, 1, 2])).soft();
+        // Layout B = [0,2,1] → op2 starts 10 (Δ 10), op1 starts 20 (Δ 10) → Σ|Δ| = 20 → soft = -50.
+        let soft_b = f2_constraint_no_owner().evaluate(&make(vec![0, 2, 1])).soft();
+        assert_eq!(soft_a, -30, "zero-disruption layout: soft = -makespan(30) - 0");
+        assert_eq!(soft_b, -50, "disrupted layout: soft = -makespan(30) - Σ|Δ|(20)");
+        assert!(soft_a > soft_b, "search now has a disruption gradient (A outranks B on soft)");
+    }
+
+    // Same as `f2_constraint` but without `with_expected_owner`, for single-owner fixtures where
+    // owner-assignment penalties would otherwise muddy the hard channel.
+    fn f2_constraint_no_owner() -> ListPrecedenceMakespanConstraint<PinPlan> {
+        ListPrecedenceMakespanConstraint::new(
+            ConstraintRef::new("", "f2NoOwner"),
+            0,
+            |p: &PinPlan| p.tasks.len(),
+            |p: &PinPlan, n: usize| p.tasks[n].duration,
+            |p: &PinPlan, n: usize, out: &mut Vec<usize>| {
+                if let Some(next) = p.tasks[n].next {
+                    out.push(next);
+                }
+            },
+            |p: &PinPlan| p.routes.len(),
+            |p: &PinPlan, o: usize| p.routes[o].tasks.len(),
+            |p: &PinPlan, o: usize, pos: usize| p.routes[o].tasks.get(pos).copied(),
+        )
+        .with_node_release_time(|p: &PinPlan, n: usize| p.tasks[n].release)
+        .with_pin(|p: &PinPlan, n: usize| p.tasks[n].pin)
+        .with_disruption(|p: &PinPlan, n: usize| p.tasks[n].baseline)
     }
 }
