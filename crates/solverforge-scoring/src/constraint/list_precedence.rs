@@ -20,6 +20,9 @@ pub struct ListPrecedenceMakespanConstraint<S> {
     list_len: fn(&S, OwnerId) -> usize,
     list_get: fn(&S, OwnerId, usize) -> Option<NodeId>,
     expected_owner: Option<fn(&S, NodeId) -> Option<OwnerId>>,
+    // ── S8a fork (eligibility): predicate "may node run on this owner?". Independent of
+    // expected_owner; feeds the SAME owner-violation hard-penalty path. Absent ⇒ no-op.
+    eligible_owner: Option<fn(&S, NodeId, OwnerId) -> bool>,
     // ── F2 fork (Lagrange M1 interactive-reflow) — per-node release-time floor + pin + disruption.
     // All three are STATIC per node (machines fixed → these never change during search), read once
     // in `build_state` alongside `durations`, and folded into the SAME incremental timing pass.
@@ -58,6 +61,7 @@ impl<S> ListPrecedenceMakespanConstraint<S> {
             list_len,
             list_get,
             expected_owner: None,
+            eligible_owner: None,
             node_release_time: None,
             pin_target: None,
             disruption_baseline: None,
@@ -73,6 +77,13 @@ impl<S> ListPrecedenceMakespanConstraint<S> {
         expected_owner: Option<fn(&S, NodeId) -> Option<OwnerId>>,
     ) -> Self {
         self.expected_owner = expected_owner;
+        self
+    }
+
+    /// S8a — per-(node, owner) eligibility predicate: a node placed in a list whose owner it is
+    /// NOT eligible for contributes one hard owner-violation. Independent of `expected_owner`.
+    pub fn with_eligible_owner(mut self, eligible: fn(&S, NodeId, OwnerId) -> bool) -> Self {
+        self.eligible_owner = Some(eligible);
         self
     }
 
@@ -188,6 +199,7 @@ impl<S> ListPrecedenceMakespanConstraint<S> {
             list_len: self.list_len,
             list_get: self.list_get,
             expected_owner: self.expected_owner,
+            eligible_owner: self.eligible_owner,
             _phantom: PhantomData,
         }
     }
@@ -346,6 +358,7 @@ struct ListPrecedenceAccess<S> {
     list_len: fn(&S, OwnerId) -> usize,
     list_get: fn(&S, OwnerId, usize) -> Option<NodeId>,
     expected_owner: Option<fn(&S, NodeId) -> Option<OwnerId>>,
+    eligible_owner: Option<fn(&S, NodeId, OwnerId) -> bool>,
     _phantom: PhantomData<fn() -> S>,
 }
 
@@ -496,6 +509,12 @@ impl ListPrecedenceState {
                 .expected_owner
                 .and_then(|expected_owner| expected_owner(solution, node))
                 .is_some_and(|expected| expected != owner)
+            {
+                snapshot.violation_count += 1;
+            }
+            if access
+                .eligible_owner
+                .is_some_and(|elig| !elig(solution, node, owner))
             {
                 snapshot.violation_count += 1;
             }
@@ -1650,5 +1669,38 @@ mod f2_fork_tests {
         .with_node_release_time(|p: &PinPlan, n: usize| p.tasks[n].release)
         .with_pin(|p: &PinPlan, n: usize| p.tasks[n].pin)
         .with_disruption(|p: &PinPlan, n: usize| p.tasks[n].baseline)
+    }
+}
+
+#[cfg(test)]
+mod s8a_eligible_tests {
+    use super::*;
+    use crate::api::constraint_set::IncrementalConstraint;
+
+    // Minimal solution: 1 op, 2 owners; op eligible only for owner 0.
+    struct Sol { seq: Vec<Vec<usize>>, eligible: Vec<Vec<usize>> }
+    fn c() -> ListPrecedenceMakespanConstraint<Sol> {
+        ListPrecedenceMakespanConstraint::new(
+            ConstraintRef::new("t", "elig"),
+            0,
+            |_s| 1usize,
+            |_s, _n| 10usize,
+            |_s, _n, _o| {},
+            |s: &Sol| s.seq.len(),
+            |s: &Sol, o| s.seq[o].len(),
+            |s: &Sol, o, p| s.seq[o].get(p).copied(),
+        )
+        .with_eligible_owner(|s: &Sol, n, o| s.eligible[n].contains(&o))
+    }
+
+    #[test]
+    fn ineligible_placement_is_hard_negative() {
+        let s = Sol { seq: vec![vec![], vec![0]], eligible: vec![vec![0]] }; // op on owner 1, only 0 allowed
+        assert!(c().evaluate(&s).hard() < 0, "op on ineligible owner must score hard<0");
+    }
+    #[test]
+    fn eligible_placement_is_hard_zero() {
+        let s = Sol { seq: vec![vec![0], vec![]], eligible: vec![vec![0]] };
+        assert_eq!(c().evaluate(&s).hard(), 0, "op on eligible owner must score hard==0");
     }
 }
