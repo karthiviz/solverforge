@@ -286,6 +286,61 @@ where
     }
 }
 
+impl<S> IncrementalConstraint<S, solverforge_core::score::HardMediumSoftScore>
+    for ListPrecedenceMakespanConstraint<S>
+where
+    S: Send + Sync,
+{
+    fn evaluate(&self, solution: &S) -> solverforge_core::score::HardMediumSoftScore {
+        self.build_state(solution).hms()
+    }
+
+    fn match_count(&self, solution: &S) -> usize {
+        self.match_count_from_state(solution)
+    }
+
+    fn initialize(&mut self, solution: &S) -> solverforge_core::score::HardMediumSoftScore {
+        let state = self.build_state(solution);
+        let score = state.hms();
+        self.state = Some(state);
+        score
+    }
+
+    fn on_insert(
+        &mut self, solution: &S, entity_index: usize, descriptor_index: usize,
+    ) -> solverforge_core::score::HardMediumSoftScore {
+        use solverforge_core::score::HardMediumSoftScore as Hms;
+        if descriptor_index != self.list_descriptor_index { return Hms::ZERO; }
+        let access = self.access();
+        let Some(state) = self.state.as_mut() else { return Hms::ZERO; };
+        if entity_index >= state.owner_edges.len() { return Hms::ZERO; }
+        let before = state.hms();
+        let change = state.add_owner_route(solution, entity_index, access);
+        state.refresh_score_after_route_change(&change);
+        state.hms() - before
+    }
+
+    fn on_retract(
+        &mut self, _solution: &S, entity_index: usize, descriptor_index: usize,
+    ) -> solverforge_core::score::HardMediumSoftScore {
+        use solverforge_core::score::HardMediumSoftScore as Hms;
+        if descriptor_index != self.list_descriptor_index { return Hms::ZERO; }
+        let Some(state) = self.state.as_mut() else { return Hms::ZERO; };
+        if entity_index >= state.owner_edges.len() { return Hms::ZERO; }
+        let before = state.hms();
+        let change = state.remove_owner_route(entity_index);
+        state.refresh_score_after_route_change(&change);
+        state.hms() - before
+    }
+
+    fn reset(&mut self) { self.state = None; }
+    fn constraint_ref(&self) -> &ConstraintRef { &self.constraint_ref }
+    fn is_hard(&self) -> bool { true }
+    fn weight(&self) -> solverforge_core::score::HardMediumSoftScore {
+        solverforge_core::score::HardMediumSoftScore::ZERO
+    }
+}
+
 struct ListPrecedenceState {
     node_count: usize,
     durations: Vec<i64>,
@@ -308,6 +363,10 @@ struct ListPrecedenceState {
     score: HardSoftScore,
     hard_penalty: usize,
     makespan: i64,
+    // ── S8b (dock re-tier): the `due`/dock-deadline overshoot, tracked SEPARATELY so the
+    // HardMediumSoftScore impl can emit it at the MEDIUM level. The HardSoftScore `score`
+    // field above keeps `due` folded into hard (unchanged); this is an ADDITIVE mirror.
+    medium_penalty: i64,
     // ── F2 fork — static per-node terms (see ListPrecedenceMakespanConstraint). Default no-op:
     //    release = 0, pin = None, disruption_baseline = None ⇒ identical to stock 0.17.1.
     release: Vec<i64>,
@@ -394,6 +453,7 @@ impl ListPrecedenceState {
             score: HardSoftScore::ZERO,
             hard_penalty: 0,
             makespan: 0,
+            medium_penalty: 0,
             release: vec![0; node_count],
             pin: vec![None; node_count],
             disruption_baseline: vec![None; node_count],
@@ -657,6 +717,9 @@ impl ListPrecedenceState {
             (0, 0, 0, 0)
         };
 
+        // S8b: store the due overshoot separately (it is `hard_deadline` from the block above).
+        self.medium_penalty = -hard_deadline;
+
         let hard = (-usize_to_i64(hard_penalty))
             .saturating_sub(pin_penalty)
             .saturating_sub(hard_deadline);
@@ -667,6 +730,18 @@ impl ListPrecedenceState {
             .saturating_sub(soft_floor);
         self.score = HardSoftScore::of(hard, soft);
         self.score
+    }
+
+    /// S8b — the HardMediumSoftScore view: same hard/soft numbers as `self.score`, but the
+    /// `due`/dock-deadline overshoot (`medium_penalty`) is moved OUT of hard and INTO medium.
+    /// `self.score.hard()` already includes `+medium_penalty` (a negative), so subtracting it
+    /// (i.e. adding its magnitude back) removes due from hard; medium then carries it.
+    fn hms(&self) -> solverforge_core::score::HardMediumSoftScore {
+        solverforge_core::score::HardMediumSoftScore::of(
+            self.score.hard() - self.medium_penalty,
+            self.medium_penalty,
+            self.score.soft(),
+        )
     }
 
     fn refresh_graph_after_route_change(&mut self, change: &RouteChange) -> GraphRefreshKind {
@@ -1089,10 +1164,11 @@ mod tests {
     fn evaluates_fixed_and_list_precedence_makespan() {
         let constraint = constraint();
 
-        assert_eq!(
-            constraint.evaluate(&plan(vec![vec![0], vec![1]])),
-            HardSoftScore::of(0, -5)
-        );
+        // S8b: the added `IncrementalConstraint<S, HardMediumSoftScore>` impl makes score-type
+        // inference ambiguous on unqualified `.evaluate()` calls; pin `HardSoftScore` explicitly
+        // (behavior unchanged — this is the only score type this test ever exercised).
+        let score: HardSoftScore = constraint.evaluate(&plan(vec![vec![0], vec![1]]));
+        assert_eq!(score, HardSoftScore::of(0, -5));
     }
 
     #[test]
@@ -1287,7 +1363,8 @@ mod tests {
     fn retract_removes_cached_owner_route_before_insert() {
         let mut constraint = constraint();
         let mut solution = plan(vec![vec![0], vec![1]]);
-        let mut score = constraint.initialize(&solution);
+        // S8b: pin `HardSoftScore` explicitly (see note in `evaluates_fixed_and_list_precedence_makespan`).
+        let mut score: HardSoftScore = constraint.initialize(&solution);
         assert_eq!(score, HardSoftScore::of(0, -5));
 
         score = score + constraint.on_retract(&solution, 0, 0);
@@ -1297,7 +1374,8 @@ mod tests {
         score = score + constraint.on_insert(&solution, 0, 0);
 
         assert_eq!(score, HardSoftScore::of(-1, -5));
-        assert_eq!(constraint.evaluate(&solution), score);
+        let final_score: HardSoftScore = constraint.evaluate(&solution);
+        assert_eq!(final_score, score);
     }
 
     #[test]
@@ -1340,10 +1418,9 @@ mod tests {
     fn penalizes_missing_duplicate_and_wrong_owner_assignments() {
         let constraint = owner_constraint();
 
-        assert_eq!(
-            constraint.evaluate(&plan(vec![vec![0, 1], vec![1]])),
-            HardSoftScore::of(-2, -5)
-        );
+        // S8b: pin `HardSoftScore` explicitly (see note in `evaluates_fixed_and_list_precedence_makespan`).
+        let score: HardSoftScore = constraint.evaluate(&plan(vec![vec![0, 1], vec![1]]));
+        assert_eq!(score, HardSoftScore::of(-2, -5));
     }
 
     #[test]
@@ -1543,7 +1620,9 @@ mod f2_fork_tests {
             score: None,
         };
         // …the constraint has NO with_pin/with_disruption → the terms are inert.
-        assert_eq!(plain.evaluate(&plan), HardSoftScore::of(0, -20));
+        // S8b: pin `HardSoftScore` explicitly (see note in `evaluates_fixed_and_list_precedence_makespan`).
+        let score: HardSoftScore = plain.evaluate(&plan);
+        assert_eq!(score, HardSoftScore::of(0, -20));
     }
 
     /// Unreachable EARLIER pin fires the HARD term — the capability the stock fallback LACKED
@@ -1560,7 +1639,8 @@ mod f2_fork_tests {
             routes: vec![PinRoute { tasks: vec![1, 0] }],
             score: None,
         };
-        let score = f2_constraint_no_owner().evaluate(&plan);
+        // S8b: pin `HardSoftScore` explicitly (see note in `evaluates_fixed_and_list_precedence_makespan`).
+        let score: HardSoftScore = f2_constraint_no_owner().evaluate(&plan);
         assert_eq!(score.hard(), -5, "unreachable earlier pin: hard = -(|10-5|) = -5");
     }
 
@@ -1579,9 +1659,12 @@ mod f2_fork_tests {
             score: None,
         };
         // Layout A = identity order → starts [0,10,20] → Σ|Δ| = 0 → soft = -30.
-        let soft_a = f2_constraint_no_owner().evaluate(&make(vec![0, 1, 2])).soft();
+        // S8b: pin `HardSoftScore` explicitly (see note in `evaluates_fixed_and_list_precedence_makespan`).
+        let score_a: HardSoftScore = f2_constraint_no_owner().evaluate(&make(vec![0, 1, 2]));
+        let soft_a = score_a.soft();
         // Layout B = [0,2,1] → op2 starts 10 (Δ 10), op1 starts 20 (Δ 10) → Σ|Δ| = 20 → soft = -50.
-        let soft_b = f2_constraint_no_owner().evaluate(&make(vec![0, 2, 1])).soft();
+        let score_b: HardSoftScore = f2_constraint_no_owner().evaluate(&make(vec![0, 2, 1]));
+        let soft_b = score_b.soft();
         assert_eq!(soft_a, -30, "zero-disruption layout: soft = -makespan(30) - 0");
         assert_eq!(soft_b, -50, "disrupted layout: soft = -makespan(30) - Σ|Δ|(20)");
         assert!(soft_a > soft_b, "search now has a disruption gradient (A outranks B on soft)");
@@ -1597,7 +1680,8 @@ mod f2_fork_tests {
             routes: vec![PinRoute { tasks: vec![0] }],
             score: None,
         };
-        let score = f2_constraint_no_owner()
+        // S8b: pin `HardSoftScore` explicitly (see note in `evaluates_fixed_and_list_precedence_makespan`).
+        let score: HardSoftScore = f2_constraint_no_owner()
             .with_node_due_time(|_p, _n| 5)
             .evaluate(&plan);
         assert_eq!(score.hard(), -5, "past-due terminal: hard = -((10 - 5).max(0)) = -5");
@@ -1619,15 +1703,16 @@ mod f2_fork_tests {
         };
         let floors = |_p: &PinPlan, n: usize| Some([30i64, 20, 10][n]);
         // Layout A = [2,1,0] → finishes op0=30,op1=20,op2=10 → Σmax(0,floor−finish)=0 → soft = -30.
-        let soft_a = f2_constraint_no_owner()
+        // S8b: pin `HardSoftScore` explicitly (see note in `evaluates_fixed_and_list_precedence_makespan`).
+        let score_a: HardSoftScore = f2_constraint_no_owner()
             .with_node_storage_floor(floors)
-            .evaluate(&make(vec![2, 1, 0]))
-            .soft();
+            .evaluate(&make(vec![2, 1, 0]));
+        let soft_a = score_a.soft();
         // Layout B = [0,1,2] → finishes op0=10,op1=20,op2=30 → 20+0+0=20 → soft = -50.
-        let soft_b = f2_constraint_no_owner()
+        let score_b: HardSoftScore = f2_constraint_no_owner()
             .with_node_storage_floor(floors)
-            .evaluate(&make(vec![0, 1, 2]))
-            .soft();
+            .evaluate(&make(vec![0, 1, 2]));
+        let soft_b = score_b.soft();
         assert_eq!(soft_a, -30, "floor-satisfying layout: soft = -makespan(30) - 0");
         assert_eq!(soft_b, -50, "floor-violating layout: soft = -makespan(30) - 20");
         assert!(soft_a > soft_b, "search now has a storage-floor gradient (A outranks B on soft)");
@@ -1646,7 +1731,9 @@ mod f2_fork_tests {
             score: None,
         };
         // No with_node_due_time / with_node_storage_floor ⇒ due/floor terms inert.
-        assert_eq!(f2_constraint_no_owner().evaluate(&plan), HardSoftScore::of(0, -20));
+        // S8b: pin `HardSoftScore` explicitly (see note in `evaluates_fixed_and_list_precedence_makespan`).
+        let score: HardSoftScore = f2_constraint_no_owner().evaluate(&plan);
+        assert_eq!(score, HardSoftScore::of(0, -20));
     }
 
     // Same as `f2_constraint` but without `with_expected_owner`, for single-owner fixtures where
@@ -1696,11 +1783,62 @@ mod s8a_eligible_tests {
     #[test]
     fn ineligible_placement_is_hard_negative() {
         let s = Sol { seq: vec![vec![], vec![0]], eligible: vec![vec![0]] }; // op on owner 1, only 0 allowed
-        assert!(c().evaluate(&s).hard() < 0, "op on ineligible owner must score hard<0");
+        // S8b: pin `HardSoftScore` explicitly (see note in `evaluates_fixed_and_list_precedence_makespan`).
+        let score: HardSoftScore = c().evaluate(&s);
+        assert!(score.hard() < 0, "op on ineligible owner must score hard<0");
     }
     #[test]
     fn eligible_placement_is_hard_zero() {
         let s = Sol { seq: vec![vec![0], vec![]], eligible: vec![vec![0]] };
-        assert_eq!(c().evaluate(&s).hard(), 0, "op on eligible owner must score hard==0");
+        let score: HardSoftScore = c().evaluate(&s);
+        assert_eq!(score.hard(), 0, "op on eligible owner must score hard==0");
+    }
+}
+
+#[cfg(test)]
+mod s8b_hms_tests {
+    use super::*;
+    use crate::api::constraint_set::IncrementalConstraint;
+    use solverforge_core::score::HardMediumSoftScore;
+
+    // 1 node, 1 owner. Node placed on owner 0. duration 10. due=5 → finish=10 overshoots by 5.
+    struct Sol { seq: Vec<Vec<usize>> }
+    fn c() -> ListPrecedenceMakespanConstraint<Sol> {
+        ListPrecedenceMakespanConstraint::new(
+            ConstraintRef::new("t", "hms"),
+            0,
+            |_s| 1usize,
+            |_s, _n| 10usize,
+            |_s, _n, _o| {},
+            |s: &Sol| s.seq.len(),
+            |s: &Sol, o| s.seq[o].len(),
+            |s: &Sol, o, p| s.seq[o].get(p).copied(),
+        )
+        .with_node_due_time(|_s: &Sol, _n| 5)
+    }
+
+    #[test]
+    fn due_overshoot_lands_in_medium_not_hard() {
+        let s = Sol { seq: vec![vec![0]] };
+        let sc: HardMediumSoftScore =
+            IncrementalConstraint::<Sol, HardMediumSoftScore>::evaluate(&c(), &s);
+        assert_eq!(sc.hard(), 0, "no structural violation → hard 0 (due is NOT hard anymore)");
+        assert_eq!(sc.medium(), -5, "due overshoot of 5 must land in medium");
+        assert_eq!(sc.soft(), -10, "soft still carries -makespan(10)");
+    }
+
+    #[test]
+    fn no_due_is_pure_widening() {
+        // Same shape but no due hook → medium must be exactly 0 (0-medium widening).
+        let c = ListPrecedenceMakespanConstraint::new(
+            ConstraintRef::new("t", "hms2"), 0,
+            |_s: &Sol| 1usize, |_s, _n| 10usize, |_s, _n, _o| {},
+            |s: &Sol| s.seq.len(), |s: &Sol, o| s.seq[o].len(),
+            |s: &Sol, o, p| s.seq[o].get(p).copied(),
+        );
+        let s = Sol { seq: vec![vec![0]] };
+        let sc: HardMediumSoftScore =
+            IncrementalConstraint::<Sol, HardMediumSoftScore>::evaluate(&c, &s);
+        assert_eq!((sc.hard(), sc.medium(), sc.soft()), (0, 0, -10));
     }
 }
