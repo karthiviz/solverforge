@@ -35,6 +35,13 @@ pub struct ListPrecedenceMakespanConstraint<S> {
     // `finishes[node]` (the completion time) rather than `earliest[node]`. Absent ⇒ no-op.
     node_due_time: Option<fn(&S, NodeId) -> i64>,
     storage_floor: Option<fn(&S, NodeId) -> Option<i64>>,
+    // ── S8b fork (Tasks 6–8) — three additional per-node/per-edge time-window penalties, read once
+    // in `build_state` (like release/pin/due) and scored inside the SAME refresh pass, but surfaced
+    // ONLY through the HardMediumSoftScore `hms()` view (the HardSoftScore `self.score` assembly is
+    // untouched — D12). Absent (None) ⇒ no-op ⇒ byte-identical to Task 1.
+    node_shelf_expiry: Option<fn(&S, NodeId) -> Option<(i64, bool)>>, // (expiry, is_hard) → medium/soft
+    node_tardiness: Option<fn(&S, NodeId) -> Option<(i64, i64)>>,     // (due, weight) → soft
+    bom_max_lag: Option<fn(&S, NodeId, NodeId) -> Option<(i64, bool)>>, // per fixed edge → (max_lag, is_hard)
     state: Option<ListPrecedenceState>,
     _phantom: PhantomData<fn() -> S>,
 }
@@ -67,6 +74,9 @@ impl<S> ListPrecedenceMakespanConstraint<S> {
             disruption_baseline: None,
             node_due_time: None,
             storage_floor: None,
+            node_shelf_expiry: None,
+            node_tardiness: None,
+            bom_max_lag: None,
             state: None,
             _phantom: PhantomData,
         }
@@ -127,6 +137,29 @@ impl<S> ListPrecedenceMakespanConstraint<S> {
         self
     }
 
+    /// S8b (Task 6) — shelf-life: per node `Some((expiry, is_hard))` penalizes `max(0, start[n] − expiry)`,
+    /// where `start[n] = earliest[n]`. Medium when hard, Soft when soft. Absent per-node ⇒ no-op.
+    pub fn with_node_shelf_expiry(mut self, shelf: fn(&S, NodeId) -> Option<(i64, bool)>) -> Self {
+        self.node_shelf_expiry = Some(shelf);
+        self
+    }
+
+    /// S8b (Task 6) — tardiness: per node `Some((due, weight))` adds `max(0, finish[n] − due) * weight`
+    /// to SOFT, read off the same `finishes[n]` timing pass. Absent per-node ⇒ no-op.
+    pub fn with_node_tardiness(mut self, tardiness: fn(&S, NodeId) -> Option<(i64, i64)>) -> Self {
+        self.node_tardiness = Some(tardiness);
+        self
+    }
+
+    /// S8b (Task 6) — BOM cross-order max-lag: for each FIXED edge `(pred, succ)`, `Some((max_lag, is_hard))`
+    /// marks it a lag-constrained BOM edge and penalizes `max(0, earliest[succ] − (finishes[pred] + max_lag))`.
+    /// Medium when hard, Soft when soft. The edge list is collected once from `fixed_successors` in
+    /// `build_state` (BOM edges are fixed, stable across search). Absent per-edge ⇒ no-op.
+    pub fn with_bom_max_lag(mut self, bom: fn(&S, NodeId, NodeId) -> Option<(i64, bool)>) -> Self {
+        self.bom_max_lag = Some(bom);
+        self
+    }
+
     fn build_state(&self, solution: &S) -> ListPrecedenceState {
         let node_count = (self.node_count)(solution);
         let owner_count = (self.list_owner_count)(solution);
@@ -137,12 +170,20 @@ impl<S> ListPrecedenceMakespanConstraint<S> {
         let mut state = ListPrecedenceState::new(node_count, owner_count, durations);
 
         let mut successors = Vec::new();
+        // S8b (Task 6) — collect lag-constrained BOM edges alongside the fixed edges (both come from
+        // `fixed_successors` and are stable across search). Empty unless `with_bom_max_lag` is set.
+        let mut bom_lag_edges: Vec<(NodeId, NodeId, i64, bool)> = Vec::new();
         for node in 0..node_count {
             successors.clear();
             (self.fixed_successors)(solution, node, &mut successors);
             for &successor in &successors {
                 if successor < node_count {
                     state.add_edge((node, successor));
+                    if let Some(f) = self.bom_max_lag {
+                        if let Some((max_lag, is_hard)) = f(solution, node, successor) {
+                            bom_lag_edges.push((node, successor, max_lag, is_hard));
+                        }
+                    }
                 } else {
                     state.invalid_fixed_edges += 1;
                 }
@@ -178,6 +219,20 @@ impl<S> ListPrecedenceMakespanConstraint<S> {
                 .map(|n| self.storage_floor.and_then(|f| f(solution, n)))
                 .collect();
             state.set_pin_terms(release, pin, baseline, due, floor);
+        }
+
+        // S8b (Task 6) — install the shelf/tardiness per-node vecs + the BOM lag-edge list.
+        if self.node_shelf_expiry.is_some()
+            || self.node_tardiness.is_some()
+            || !bom_lag_edges.is_empty()
+        {
+            let shelf = (0..node_count)
+                .map(|n| self.node_shelf_expiry.and_then(|f| f(solution, n)))
+                .collect();
+            let tardiness = (0..node_count)
+                .map(|n| self.node_tardiness.and_then(|f| f(solution, n)))
+                .collect();
+            state.set_s8b_terms(shelf, tardiness, bom_lag_edges);
         }
 
         state.refresh_score_full();
@@ -375,6 +430,14 @@ struct ListPrecedenceState {
     // Dock deadline (Task 7) — per-node due (HARD) + storage-floor (SOFT). Default no-op: None.
     due: Vec<Option<i64>>,
     floor: Vec<Option<i64>>,
+    // ── S8b fork (Tasks 6–8) — shelf/tardiness per-node terms + BOM per-edge lag list, plus the
+    // combined medium/soft accumulators they feed. Default no-op: all None/empty/0. Read ONLY by
+    // `hms()`; `self.score` never sees them (D12 — HardSoftScore path byte-identical).
+    shelf: Vec<Option<(i64, bool)>>,                 // (expiry, is_hard) per node
+    tardiness: Vec<Option<(i64, i64)>>,              // (due, weight) per node
+    bom_lag_edges: Vec<(NodeId, NodeId, i64, bool)>, // (pred, succ, max_lag, is_hard)
+    extra_medium: i64,                               // ≤ 0: shelf-hard + BOM-lag-hard overshoot
+    extra_soft: i64,                                 // ≤ 0: shelf-soft + tardiness + BOM-lag-soft
 }
 
 #[derive(Default)]
@@ -459,6 +522,11 @@ impl ListPrecedenceState {
             disruption_baseline: vec![None; node_count],
             due: vec![None; node_count],
             floor: vec![None; node_count],
+            shelf: vec![None; node_count],
+            tardiness: vec![None; node_count],
+            bom_lag_edges: Vec::new(),
+            extra_medium: 0,
+            extra_soft: 0,
         }
     }
 
@@ -478,6 +546,20 @@ impl ListPrecedenceState {
         self.disruption_baseline = disruption_baseline;
         self.due = due;
         self.floor = floor;
+    }
+
+    /// S8b (Task 6) — install the shelf/tardiness per-node terms and the BOM lag-edge list (called by
+    /// `build_state` after `set_pin_terms`, before the first `refresh_score_full`). Read-only for the
+    /// lifetime of the state (machines + BOM edges fixed).
+    fn set_s8b_terms(
+        &mut self,
+        shelf: Vec<Option<(i64, bool)>>,
+        tardiness: Vec<Option<(i64, i64)>>,
+        bom_lag_edges: Vec<(NodeId, NodeId, i64, bool)>,
+    ) {
+        self.shelf = shelf;
+        self.tardiness = tardiness;
+        self.bom_lag_edges = bom_lag_edges;
     }
 
     fn add_edge(&mut self, edge: Edge) -> bool {
@@ -720,6 +802,48 @@ impl ListPrecedenceState {
         // S8b: store the due overshoot separately (it is `hard_deadline` from the block above).
         self.medium_penalty = -hard_deadline;
 
+        // S8b (Task 6) — shelf/tardiness (per node, off `earliest`/`finishes`) + BOM max-lag (per
+        // edge) penalties, computed under the SAME acyclic gate as pin/disruption/due and accumulated
+        // into the medium/soft-only sidecars read by `hms()`. `self.score` (below) is UNAFFECTED (D12).
+        let (extra_medium, extra_soft) = if self.cycle_penalty == 0 {
+            let mut shelf_medium = 0i64;
+            let mut shelf_soft = 0i64;
+            let mut tardiness_soft = 0i64;
+            let mut bom_medium = 0i64;
+            let mut bom_soft = 0i64;
+            for node in 0..self.node_count {
+                if let Some((expiry, is_hard)) = self.shelf[node] {
+                    let overshoot = (self.earliest[node] - expiry).max(0);
+                    if is_hard {
+                        shelf_medium = shelf_medium.saturating_add(overshoot);
+                    } else {
+                        shelf_soft = shelf_soft.saturating_add(overshoot);
+                    }
+                }
+                if let Some((due, weight)) = self.tardiness[node] {
+                    let over = (self.finishes[node] - due).max(0);
+                    tardiness_soft = tardiness_soft.saturating_add(over.saturating_mul(weight));
+                }
+            }
+            for &(pred, succ, max_lag, is_hard) in &self.bom_lag_edges {
+                let excess =
+                    (self.earliest[succ] - self.finishes[pred].saturating_add(max_lag)).max(0);
+                if is_hard {
+                    bom_medium = bom_medium.saturating_add(excess);
+                } else {
+                    bom_soft = bom_soft.saturating_add(excess);
+                }
+            }
+            (
+                -(shelf_medium.saturating_add(bom_medium)),
+                -(shelf_soft.saturating_add(tardiness_soft).saturating_add(bom_soft)),
+            )
+        } else {
+            (0, 0)
+        };
+        self.extra_medium = extra_medium;
+        self.extra_soft = extra_soft;
+
         let hard = (-usize_to_i64(hard_penalty))
             .saturating_sub(pin_penalty)
             .saturating_sub(hard_deadline);
@@ -737,10 +861,12 @@ impl ListPrecedenceState {
     /// `self.score.hard()` already includes `+medium_penalty` (a negative), so subtracting it
     /// (i.e. adding its magnitude back) removes due from hard; medium then carries it.
     fn hms(&self) -> solverforge_core::score::HardMediumSoftScore {
+        // dock/`due` (`medium_penalty`) + shelf-hard/BOM-lag-hard (`extra_medium`) land in MEDIUM;
+        // shelf-soft/tardiness/BOM-lag-soft (`extra_soft`) join makespan/disruption/floor in SOFT.
         solverforge_core::score::HardMediumSoftScore::of(
             self.score.hard() - self.medium_penalty,
-            self.medium_penalty,
-            self.score.soft(),
+            self.medium_penalty + self.extra_medium,
+            self.score.soft() + self.extra_soft,
         )
     }
 
@@ -1840,5 +1966,70 @@ mod s8b_hms_tests {
         let sc: HardMediumSoftScore =
             IncrementalConstraint::<Sol, HardMediumSoftScore>::evaluate(&c, &s);
         assert_eq!((sc.hard(), sc.medium(), sc.soft()), (0, 0, -10));
+    }
+
+    #[test]
+    fn shelf_hard_overshoot_lands_in_medium() {
+        // seq [0,1] on owner 0, durations 10 each → earliest[1]=10. shelf expiry 5 on node 1 → 5.
+        let c = ListPrecedenceMakespanConstraint::new(
+            ConstraintRef::new("t", "shelf"), 0,
+            |_s: &Sol| 2usize, |_s, _n| 10usize, |_s, _n, _o| {},
+            |s: &Sol| s.seq.len(), |s: &Sol, o| s.seq[o].len(),
+            |s: &Sol, o, p| s.seq[o].get(p).copied(),
+        )
+        .with_node_shelf_expiry(|_s: &Sol, n| if n == 1 { Some((5, true)) } else { None });
+        let s = Sol { seq: vec![vec![0, 1]] };
+        let sc: HardMediumSoftScore =
+            IncrementalConstraint::<Sol, HardMediumSoftScore>::evaluate(&c, &s);
+        assert_eq!((sc.hard(), sc.medium(), sc.soft()), (0, -5, -20));
+    }
+
+    #[test]
+    fn shelf_soft_overshoot_lands_in_soft() {
+        let c = ListPrecedenceMakespanConstraint::new(
+            ConstraintRef::new("t", "shelf2"), 0,
+            |_s: &Sol| 2usize, |_s, _n| 10usize, |_s, _n, _o| {},
+            |s: &Sol| s.seq.len(), |s: &Sol, o| s.seq[o].len(),
+            |s: &Sol, o, p| s.seq[o].get(p).copied(),
+        )
+        .with_node_shelf_expiry(|_s: &Sol, n| if n == 1 { Some((5, false)) } else { None });
+        let s = Sol { seq: vec![vec![0, 1]] };
+        let sc: HardMediumSoftScore =
+            IncrementalConstraint::<Sol, HardMediumSoftScore>::evaluate(&c, &s);
+        assert_eq!((sc.hard(), sc.medium(), sc.soft()), (0, 0, -20 - 5));
+    }
+
+    #[test]
+    fn tardiness_penalizes_soft_weighted() {
+        // 1 node dur 10, due 3 weight 2 → over 7 * 2 = 14 into soft (alongside makespan 10).
+        let c = ListPrecedenceMakespanConstraint::new(
+            ConstraintRef::new("t", "tard"), 0,
+            |_s: &Sol| 1usize, |_s, _n| 10usize, |_s, _n, _o| {},
+            |s: &Sol| s.seq.len(), |s: &Sol, o| s.seq[o].len(),
+            |s: &Sol, o, p| s.seq[o].get(p).copied(),
+        )
+        .with_node_tardiness(|_s: &Sol, _n| Some((3, 2)));
+        let s = Sol { seq: vec![vec![0]] };
+        let sc: HardMediumSoftScore =
+            IncrementalConstraint::<Sol, HardMediumSoftScore>::evaluate(&c, &s);
+        assert_eq!((sc.hard(), sc.medium(), sc.soft()), (0, 0, -10 - 14));
+    }
+
+    #[test]
+    fn bom_max_lag_hard_overshoot_lands_in_medium() {
+        // Fixed BOM edge 0→1. seq [0,2,1]: spacer node 2 (dur 10) pushes consumer 1 to start at 20;
+        // producer 0 ends at 10; lag 5 → per-edge excess = 20 − (10 + 5) = 5 → medium -5.
+        let c = ListPrecedenceMakespanConstraint::new(
+            ConstraintRef::new("t", "bomlag"), 0,
+            |_s: &Sol| 3usize, |_s, _n| 10usize,
+            |_s: &Sol, n, out: &mut Vec<usize>| { if n == 0 { out.push(1); } },
+            |s: &Sol| s.seq.len(), |s: &Sol, o| s.seq[o].len(),
+            |s: &Sol, o, p| s.seq[o].get(p).copied(),
+        )
+        .with_bom_max_lag(|_s: &Sol, pred, succ| if (pred, succ) == (0, 1) { Some((5, true)) } else { None });
+        let s = Sol { seq: vec![vec![0, 2, 1]] };
+        let sc: HardMediumSoftScore =
+            IncrementalConstraint::<Sol, HardMediumSoftScore>::evaluate(&c, &s);
+        assert_eq!(sc.medium(), -5, "bom max-lag per-edge excess 5 → medium -5");
     }
 }
