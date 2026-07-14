@@ -4,10 +4,11 @@ use solverforge_core::domain::PlanningSolution;
 use solverforge_scoring::Director;
 
 use crate::heuristic::r#move::{
-    KOptMove, ListChangeMove, ListMoveUnion, ListPermuteMove, ListReverseMove, ListRuinMove,
-    ListSwapMove, Move, SublistChangeMove, SublistSwapMove,
+    FamilyBlockMove, KOptMove, ListChangeMove, ListMoveUnion, ListPermuteMove, ListReverseMove,
+    ListRuinMove, ListSwapMove, Move, SublistChangeMove, SublistSwapMove,
 };
 use crate::heuristic::selector::decorator::MappedMoveCursor;
+use crate::heuristic::selector::family_block::FamilyBlockMoveSelector;
 use crate::heuristic::selector::nearby_list_change::CrossEntityDistanceMeter;
 use crate::heuristic::selector::precedence_route::{PrecedenceRouteGraph, PrecedenceRouteHooks};
 use crate::heuristic::selector::{
@@ -45,6 +46,7 @@ where
     ListPermute(ListPermuteMoveSelector<S, V, FromSolutionEntitySelector>),
     ListPrecedence(ListPrecedenceMoveSelector<S, V, FromSolutionEntitySelector>),
     SublistSwap(SublistSwapMoveSelector<S, V, FromSolutionEntitySelector>),
+    FamilyBlock(FamilyBlockMoveSelector<S, V, FromSolutionEntitySelector>),
 }
 
 fn wrap_list_change_move<S, V>(mov: ListChangeMove<S, V>) -> ListMoveUnion<S, V>
@@ -109,6 +111,14 @@ where
     V: Clone + PartialEq + Send + Sync + Debug + 'static,
 {
     ListMoveUnion::SublistSwap(mov)
+}
+
+fn wrap_family_block_move<S, V>(mov: FamilyBlockMove<S, V>) -> ListMoveUnion<S, V>
+where
+    S: PlanningSolution,
+    V: Clone + PartialEq + Send + Sync + Debug + 'static,
+{
+    ListMoveUnion::FamilyBlock(mov)
 }
 
 fn precedence_route_graph<S, V, D: Director<S>>(
@@ -258,6 +268,16 @@ where
         >>::Cursor<'a>,
         fn(SublistSwapMove<S, V>) -> ListMoveUnion<S, V>,
     >),
+    FamilyBlock(MappedMoveCursor<
+        S,
+        FamilyBlockMove<S, V>,
+        ListMoveUnion<S, V>,
+        <FamilyBlockMoveSelector<S, V, FromSolutionEntitySelector> as MoveSelector<
+            S,
+            FamilyBlockMove<S, V>,
+        >>::Cursor<'a>,
+        fn(FamilyBlockMove<S, V>) -> ListMoveUnion<S, V>,
+    >),
 }
 
 impl<'a, S, V, DM, IDM> MoveCursor<S, ListMoveUnion<S, V>> for ListLeafCursor<'a, S, V, DM, IDM>
@@ -281,6 +301,7 @@ where
             Self::ListPermute(cursor) => cursor.next_candidate(),
             Self::ListPrecedence(cursor) => cursor.next_candidate(),
             Self::SublistSwap(cursor) => cursor.next_candidate(),
+            Self::FamilyBlock(cursor) => cursor.next_candidate(),
         }
     }
 
@@ -301,6 +322,7 @@ where
             Self::ListPermute(cursor) => cursor.candidate(index),
             Self::ListPrecedence(cursor) => cursor.candidate(index),
             Self::SublistSwap(cursor) => cursor.candidate(index),
+            Self::FamilyBlock(cursor) => cursor.candidate(index),
         }
     }
 
@@ -318,6 +340,7 @@ where
             Self::ListPermute(cursor) => cursor.take_candidate(index),
             Self::ListPrecedence(cursor) => cursor.take_candidate(index),
             Self::SublistSwap(cursor) => cursor.take_candidate(index),
+            Self::FamilyBlock(cursor) => cursor.take_candidate(index),
         }
     }
 
@@ -335,6 +358,7 @@ where
             Self::ListPermute(cursor) => cursor.selector_index(index),
             Self::ListPrecedence(cursor) => cursor.selector_index(index),
             Self::SublistSwap(cursor) => cursor.selector_index(index),
+            Self::FamilyBlock(cursor) => cursor.selector_index(index),
         }
     }
 }
@@ -360,6 +384,7 @@ where
             Self::ListPermute(s) => write!(f, "ListLeafSelector::ListPermute({s:?})"),
             Self::ListPrecedence(s) => write!(f, "ListLeafSelector::ListPrecedence({s:?})"),
             Self::SublistSwap(s) => write!(f, "ListLeafSelector::SublistSwap({s:?})"),
+            Self::FamilyBlock(s) => write!(f, "ListLeafSelector::FamilyBlock({s:?})"),
         }
     }
 }
@@ -465,6 +490,10 @@ where
                     )),
                 wrap_sublist_swap_move::<S, V>,
             )),
+            Self::FamilyBlock(s) => ListLeafCursor::FamilyBlock(MappedMoveCursor::new(
+                s.open_cursor_with_context(score_director, context),
+                wrap_family_block_move::<S, V>,
+            )),
         }
     }
 
@@ -500,6 +529,7 @@ where
             Self::ListPermute(s) => guarded_size!(s),
             Self::ListPrecedence(s) => s.size(score_director),
             Self::SublistSwap(s) => guarded_size!(s),
+            Self::FamilyBlock(s) => s.size(score_director),
         }
     }
 }

@@ -126,7 +126,8 @@ fn selector_family(config: &MoveSelectorConfig) -> SelectorFamily {
         | MoveSelectorConfig::SublistSwapMoveSelector(_)
         | MoveSelectorConfig::ListReverseMoveSelector(_)
         | MoveSelectorConfig::KOptMoveSelector(_)
-        | MoveSelectorConfig::ListRuinMoveSelector(_) => SelectorFamily::List,
+        | MoveSelectorConfig::ListRuinMoveSelector(_)
+        | MoveSelectorConfig::FamilyBlockMoveSelector(_) => SelectorFamily::List,
         MoveSelectorConfig::LimitedNeighborhood(limit) => selector_family(limit.selector.as_ref()),
         MoveSelectorConfig::UnionMoveSelector(union) => {
             let mut family = None;
@@ -349,6 +350,7 @@ fn list_selector_target(config: Option<&MoveSelectorConfig>) -> Option<&solverfo
         MoveSelectorConfig::ListReverseMoveSelector(config) => Some(&config.target),
         MoveSelectorConfig::KOptMoveSelector(config) => Some(&config.target),
         MoveSelectorConfig::ListRuinMoveSelector(config) => Some(&config.target),
+        MoveSelectorConfig::FamilyBlockMoveSelector(config) => Some(&config.target),
         _ => None,
     }
 }
@@ -399,6 +401,7 @@ fn matching_dynamic_list_variables<S, V, DM, IDM>(
         MoveSelectorConfig::ListReverseMoveSelector(config) => Some(&config.target),
         MoveSelectorConfig::KOptMoveSelector(config) => Some(&config.target),
         MoveSelectorConfig::ListRuinMoveSelector(config) => Some(&config.target),
+        MoveSelectorConfig::FamilyBlockMoveSelector(config) => Some(&config.target),
         _ => None,
     };
     let Some(target) = target else {
@@ -451,7 +454,8 @@ fn push_dynamic_list_selector<S, V, DM, IDM>(
         | MoveSelectorConfig::SublistSwapMoveSelector(_)
         | MoveSelectorConfig::ListReverseMoveSelector(_)
         | MoveSelectorConfig::KOptMoveSelector(_)
-        | MoveSelectorConfig::ListRuinMoveSelector(_) => {
+        | MoveSelectorConfig::ListRuinMoveSelector(_)
+        | MoveSelectorConfig::FamilyBlockMoveSelector(_) => {
             panic!(
                 "dynamic list variables currently support list_change_move_selector; \
                  configured selector matched a dynamic list variable but is not bindable"

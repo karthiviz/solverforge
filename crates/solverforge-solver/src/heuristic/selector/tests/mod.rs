@@ -5,6 +5,7 @@ use solverforge_scoring::Director;
 
 use super::EntityReference;
 
+mod family_block;
 mod k_opt;
 mod list_neighborhood;
 mod list_permute;

@@ -35,7 +35,8 @@ where
         | Some(MoveSelectorConfig::SublistSwapMoveSelector(_))
         | Some(MoveSelectorConfig::ListReverseMoveSelector(_))
         | Some(MoveSelectorConfig::KOptMoveSelector(_))
-        | Some(MoveSelectorConfig::ListRuinMoveSelector(_)) => {
+        | Some(MoveSelectorConfig::ListRuinMoveSelector(_))
+        | Some(MoveSelectorConfig::FamilyBlockMoveSelector(_)) => {
             push_list_selector(config, model, random_seed, &mut leaves);
             push_dynamic_list_selector(config, model, &mut leaves);
         }

@@ -248,3 +248,37 @@ fn grouped_scalar_move_selector_parses_and_roundtrips() {
     assert_eq!(selector.max_moves_per_step, Some(64));
     assert!(selector.require_hard_improvement);
 }
+
+#[test]
+fn family_block_move_selector_parses_and_roundtrips() {
+    let toml = r#"
+        [[phases]]
+        type = "local_search"
+
+        [phases.move_selector]
+        type = "family_block_move_selector"
+        min_block_size = 2
+        entity_class = "SfMachineSequence"
+        variable_name = "sequence"
+    "#;
+
+    let config = SolverConfig::from_toml_str(toml).unwrap();
+    let encoded = toml::to_string(&config).unwrap();
+    let reparsed = SolverConfig::from_toml_str(&encoded).unwrap();
+    let PhaseConfig::LocalSearch(local_search) = &reparsed.phases[0] else {
+        panic!("phase should be local_search");
+    };
+    let Some(MoveSelectorConfig::FamilyBlockMoveSelector(selector)) = &local_search.move_selector
+    else {
+        panic!("local search should have family block selector");
+    };
+
+    assert_eq!(selector.min_block_size, 2);
+    assert_eq!(
+        selector.target,
+        VariableTargetConfig {
+            entity_class: Some("SfMachineSequence".to_string()),
+            variable_name: Some("sequence".to_string()),
+        }
+    );
+}

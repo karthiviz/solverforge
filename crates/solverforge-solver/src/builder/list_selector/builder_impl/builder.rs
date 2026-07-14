@@ -192,6 +192,9 @@ impl ListMoveSelectorBuilder {
             MoveSelectorConfig::SublistSwapMoveSelector(c) => {
                 Self::push_sublist_swap(out, ctx, c.min_sublist_size, c.max_sublist_size);
             }
+            MoveSelectorConfig::FamilyBlockMoveSelector(c) => {
+                Self::push_family_block(out, ctx, c.min_block_size);
+            }
             MoveSelectorConfig::KOptMoveSelector(c) => {
                 Self::push_kopt(out, ctx, c.k, c.min_segment_len, c.max_nearby);
             }
@@ -455,6 +458,41 @@ impl ListMoveSelectorBuilder {
         .with_element_owner_fn(ctx.element_owner_fn);
         let inner = inner.with_precedence_route_hooks(Self::precedence_route_hooks(ctx));
         out.push(ListLeafSelector::SublistSwap(inner));
+    }
+
+    fn push_family_block<S, V, DM, IDM>(
+        out: &mut Vec<ListLeafSelector<S, V, DM, IDM>>,
+        ctx: &ListVariableSlot<S, V, DM, IDM>,
+        min_block_size: usize,
+    ) where
+        S: PlanningSolution,
+        V: Clone + PartialEq + Send + Sync + Debug + 'static,
+        DM: CrossEntityDistanceMeter<S> + Clone,
+        IDM: CrossEntityDistanceMeter<S> + Clone + 'static,
+    {
+        use crate::heuristic::selector::family_block::FamilyBlockMoveSelector;
+
+        let (Some(family_fn), Some(eligible_fn)) =
+            (ctx.element_family_key_fn, ctx.element_eligible_owners_fn)
+        else {
+            panic!(
+                "family_block_move_selector requires element_family_key_fn and element_eligible_owners_fn on {}.{}",
+                ctx.entity_type_name, ctx.variable_name
+            );
+        };
+        let inner = FamilyBlockMoveSelector::new(
+            FromSolutionEntitySelector::new(ctx.descriptor_index),
+            min_block_size,
+            ctx.list_len,
+            ctx.list_get,
+            ctx.sublist_remove,
+            ctx.sublist_insert,
+            family_fn,
+            eligible_fn,
+            ctx.variable_name,
+            ctx.descriptor_index,
+        );
+        out.push(ListLeafSelector::FamilyBlock(inner));
     }
 
     fn push_kopt<S, V, DM, IDM>(

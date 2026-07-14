@@ -406,7 +406,8 @@ fn collect_scalar_leaf_selectors<S>(
             | MoveSelectorConfig::SublistSwapMoveSelector(_)
             | MoveSelectorConfig::ListReverseMoveSelector(_)
             | MoveSelectorConfig::KOptMoveSelector(_)
-            | MoveSelectorConfig::ListRuinMoveSelector(_) => {
+            | MoveSelectorConfig::ListRuinMoveSelector(_)
+            | MoveSelectorConfig::FamilyBlockMoveSelector(_) => {
                 panic!("list move selector configured against a scalar-variable model");
             }
             MoveSelectorConfig::CartesianProductMoveSelector(_) => {

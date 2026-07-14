@@ -59,6 +59,9 @@ pub enum MoveSelectorConfig {
     // Sublist swap move selector — swaps contiguous segments between routes.
     SublistSwapMoveSelector(SublistSwapMoveConfig),
 
+    // Family-block move selector — relocates a maximal same-family contiguous run atomically.
+    FamilyBlockMoveSelector(FamilyBlockMoveConfig),
+
     // List reverse move selector (2-opt) — reverses segments within a route.
     ListReverseMoveSelector(ListReverseMoveConfig),
 
@@ -339,6 +342,25 @@ impl Default for SublistSwapMoveConfig {
             min_sublist_size,
             max_sublist_size,
             target,
+        }
+    }
+}
+
+// Configuration for `FamilyBlockMoveSelector`.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct FamilyBlockMoveConfig {
+    // Minimum contiguous same-family block size (inclusive). Default: 2.
+    pub min_block_size: usize,
+    #[serde(flatten)]
+    pub target: VariableTargetConfig,
+}
+
+impl Default for FamilyBlockMoveConfig {
+    fn default() -> Self {
+        Self {
+            min_block_size: 2,
+            target: VariableTargetConfig::default(),
         }
     }
 }

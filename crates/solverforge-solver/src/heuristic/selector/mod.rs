@@ -8,6 +8,7 @@ pub mod decorator;
 pub mod dynamic_list_change;
 pub mod dynamic_scalar_change;
 pub mod entity;
+pub mod family_block;
 pub mod k_opt;
 pub mod list_change;
 pub mod list_permute;
@@ -42,6 +43,7 @@ pub use dynamic_scalar_change::DynamicScalarChangeMoveSelector;
 pub use entity::{
     AllEntitiesSelector, EntityReference, EntitySelector, FromSolutionEntitySelector,
 };
+pub use family_block::FamilyBlockMoveSelector;
 pub use k_opt::{
     DefaultDistanceMeter, KOptConfig, KOptMoveSelector, ListPositionDistanceMeter,
     NearbyKOptMoveSelector,
