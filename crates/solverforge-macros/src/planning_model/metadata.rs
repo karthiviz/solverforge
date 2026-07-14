@@ -95,6 +95,8 @@ fn parse_entity(module: &ModuleSource, item_struct: &ItemStruct) -> Result<Entit
     let mut list_construction_element_order_key = None;
     let mut list_precedence_duration_fn = None;
     let mut list_precedence_successors_fn = None;
+    let mut list_element_family_key_fn = None;
+    let mut list_element_eligible_owners_fn = None;
 
     for field in fields {
         if has_attribute(&field.attrs, "planning_variable") {
@@ -189,6 +191,10 @@ fn parse_entity(module: &ModuleSource, item_struct: &ItemStruct) -> Result<Entit
                 parse_hook_path(attr, "precedence_duration_fn", &module.ident, field)?;
             list_precedence_successors_fn =
                 parse_hook_path(attr, "precedence_successors_fn", &module.ident, field)?;
+            list_element_family_key_fn =
+                parse_hook_path(attr, "element_family_key_fn", &module.ident, field)?;
+            list_element_eligible_owners_fn =
+                parse_hook_path(attr, "element_eligible_owners_fn", &module.ident, field)?;
         }
     }
 
@@ -201,6 +207,8 @@ fn parse_entity(module: &ModuleSource, item_struct: &ItemStruct) -> Result<Entit
         list_construction_element_order_key,
         list_precedence_duration_fn,
         list_precedence_successors_fn,
+        list_element_family_key_fn,
+        list_element_eligible_owners_fn,
     })
 }
 

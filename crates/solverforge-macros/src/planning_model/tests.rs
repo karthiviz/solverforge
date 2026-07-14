@@ -44,4 +44,13 @@ fn expansion_attaches_list_order_and_precedence_hooks_to_existing_slots() {
     assert!(expanded.contains("route :: operation_construction_order"));
     assert!(expanded.contains("route :: operation_duration"));
     assert!(expanded.contains("route :: operation_successors"));
+
+    // Lagrange S8d: element_family_key_fn / element_eligible_owners_fn reach the
+    // ListVariableSlot via the same attach_runtime_list_hooks mechanism as the
+    // precedence hooks above.
+    assert!(expanded.contains("__solverforge_runtime_list_element_family_key_routes"));
+    assert!(expanded.contains("__solverforge_runtime_list_element_eligible_owners_routes"));
+    assert!(expanded.contains("slot = slot . with_family_block_hooks"));
+    assert!(expanded.contains("route :: operation_family_key"));
+    assert!(expanded.contains("route :: operation_eligible_owners"));
 }

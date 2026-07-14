@@ -47,6 +47,8 @@ pub struct ListVariableSlot<S, V, DM, IDM> {
     pub construction_element_order_key: Option<fn(&S, V) -> i64>,
     pub precedence_duration_fn: Option<fn(&S, V) -> usize>,
     pub precedence_successors_fn: Option<fn(&S, V, &mut Vec<V>)>,
+    pub element_family_key_fn: Option<fn(&S, V) -> Option<u64>>,
+    pub element_eligible_owners_fn: Option<fn(&S, V) -> Vec<usize>>,
     _phantom: PhantomData<(fn() -> S, fn() -> V)>,
 }
 
@@ -86,6 +88,8 @@ impl<S, V, DM: Clone, IDM: Clone> Clone for ListVariableSlot<S, V, DM, IDM> {
             construction_element_order_key: self.construction_element_order_key,
             precedence_duration_fn: self.precedence_duration_fn,
             precedence_successors_fn: self.precedence_successors_fn,
+            element_family_key_fn: self.element_family_key_fn,
+            element_eligible_owners_fn: self.element_eligible_owners_fn,
             _phantom: PhantomData,
         }
     }
@@ -158,6 +162,8 @@ impl<S, V, DM, IDM> ListVariableSlot<S, V, DM, IDM> {
             construction_element_order_key: None,
             precedence_duration_fn: None,
             precedence_successors_fn: None,
+            element_family_key_fn: None,
+            element_eligible_owners_fn: None,
             _phantom: PhantomData,
         }
     }
@@ -185,6 +191,16 @@ impl<S, V, DM, IDM> ListVariableSlot<S, V, DM, IDM> {
     ) -> Self {
         self.precedence_duration_fn = duration_fn;
         self.precedence_successors_fn = successors_fn;
+        self
+    }
+
+    pub fn with_family_block_hooks(
+        mut self,
+        element_family_key_fn: Option<fn(&S, V) -> Option<u64>>,
+        element_eligible_owners_fn: Option<fn(&S, V) -> Vec<usize>>,
+    ) -> Self {
+        self.element_family_key_fn = element_family_key_fn;
+        self.element_eligible_owners_fn = element_eligible_owners_fn;
         self
     }
 

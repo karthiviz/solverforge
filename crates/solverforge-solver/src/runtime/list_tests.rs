@@ -613,3 +613,49 @@ fn empty_list_runtime_builds_construction_plus_streaming_local_search() {
     assert!(debug.contains("accepted_count_limit: 256"));
     assert!(!debug.contains("VariableNeighborhoodDescent"));
 }
+
+fn route_element_family_key(_: &GenericListPlan, element: usize) -> Option<u64> {
+    Some(element as u64 / 10)
+}
+
+fn route_element_eligible_owners(_: &GenericListPlan, _: usize) -> Vec<usize> {
+    vec![0, 1]
+}
+
+/// Lagrange S8d — `with_family_block_hooks` attaches both hooks onto the slot and each is
+/// independently readable; a slot with neither hook set carries `None` for both.
+#[test]
+fn with_family_block_hooks_attaches_both_hooks_onto_the_slot() {
+    let model = generic_list_model();
+    let VariableSlot::List(slot) = &model.variables()[0] else {
+        panic!("expected a list slot");
+    };
+    assert!(slot.element_family_key_fn.is_none());
+    assert!(slot.element_eligible_owners_fn.is_none());
+
+    let slot = slot
+        .clone()
+        .with_family_block_hooks(Some(route_element_family_key), None);
+    assert!(slot.element_family_key_fn.is_some());
+    assert!(slot.element_eligible_owners_fn.is_none());
+    assert_eq!((slot.element_family_key_fn.unwrap())(&model_solution(), 23), Some(2));
+
+    let slot = slot.with_family_block_hooks(
+        Some(route_element_family_key),
+        Some(route_element_eligible_owners),
+    );
+    assert!(slot.element_family_key_fn.is_some());
+    assert!(slot.element_eligible_owners_fn.is_some());
+    assert_eq!(
+        (slot.element_eligible_owners_fn.unwrap())(&model_solution(), 0),
+        vec![0, 1]
+    );
+}
+
+fn model_solution() -> GenericListPlan {
+    GenericListPlan {
+        score: None,
+        routes: vec![Vec::new(), Vec::new()],
+        route_pool: vec![10],
+    }
+}

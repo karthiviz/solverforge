@@ -93,6 +93,8 @@ const PLANNING_LIST_VARIABLE_ARGS: &[AttributeArgSpec] = &[
     AttributeArgSpec::string("construction_element_order_key"),
     AttributeArgSpec::string("precedence_duration_fn"),
     AttributeArgSpec::string("precedence_successors_fn"),
+    AttributeArgSpec::string("element_family_key_fn"),
+    AttributeArgSpec::string("element_eligible_owners_fn"),
     AttributeArgSpec::string("solution_trait"),
 ];
 

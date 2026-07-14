@@ -13,7 +13,9 @@ pub struct Route {
         element_owner_fn = "operation_owner",
         construction_element_order_key = "operation_construction_order",
         precedence_duration_fn = "operation_duration",
-        precedence_successors_fn = "operation_successors"
+        precedence_successors_fn = "operation_successors",
+        element_family_key_fn = "operation_family_key",
+        element_eligible_owners_fn = "operation_eligible_owners"
     )]
     pub operations: Vec<usize>,
 }
@@ -82,4 +84,19 @@ pub(super) fn operation_successors(
     if let Some(next) = plan.operations.get(operation_id).and_then(|operation| operation.next) {
         out.push(next);
     }
+}
+
+/// S8d: setup-family identity — groups elements sharing a changeover-relevant family.
+pub(super) fn operation_family_key(plan: &super::Plan, operation_id: usize) -> Option<u64> {
+    plan.operations
+        .get(operation_id)
+        .map(|operation| operation.route_id as u64)
+}
+
+/// S8d: eligible-owner set for a family-block move/selector to consult generically.
+pub(super) fn operation_eligible_owners(plan: &super::Plan, operation_id: usize) -> Vec<usize> {
+    plan.operations
+        .get(operation_id)
+        .map(|operation| vec![operation.route_id])
+        .unwrap_or_default()
 }

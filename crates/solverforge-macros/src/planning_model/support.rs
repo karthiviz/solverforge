@@ -537,6 +537,54 @@ fn generate_support_impl(model: &ModelMetadata) -> Result<TokenStream> {
                 }
             });
         }
+
+        if let Some(variable_name) = entity.list_variable_name.as_ref().filter(|_| {
+            entity.list_element_family_key_fn.is_some()
+                || entity.list_element_eligible_owners_fn.is_some()
+        }) {
+            let family_key_expr = if let Some(path) = &entity.list_element_family_key_fn {
+                let helper = format_ident!(
+                    "__solverforge_runtime_list_element_family_key_{}",
+                    entity_field
+                );
+                list_runtime_helpers.push(quote! {
+                    fn #helper(
+                        solution: &#solution_path,
+                        element: usize,
+                    ) -> ::core::option::Option<u64> {
+                        #path(solution, element)
+                    }
+                });
+                quote! { ::core::option::Option::Some(#helper) }
+            } else {
+                quote! { ::core::option::Option::None }
+            };
+            let eligible_owners_expr = if let Some(path) = &entity.list_element_eligible_owners_fn
+            {
+                let helper = format_ident!(
+                    "__solverforge_runtime_list_element_eligible_owners_{}",
+                    entity_field
+                );
+                list_runtime_helpers.push(quote! {
+                    fn #helper(
+                        solution: &#solution_path,
+                        element: usize,
+                    ) -> ::std::vec::Vec<usize> {
+                        #path(solution, element)
+                    }
+                });
+                quote! { ::core::option::Option::Some(#helper) }
+            } else {
+                quote! { ::core::option::Option::None }
+            };
+            list_runtime_attachments.push(quote! {
+                if slot.descriptor_index == #descriptor_index
+                    && slot.variable_name == #variable_name
+                {
+                    slot = slot.with_family_block_hooks(#family_key_expr, #eligible_owners_expr);
+                }
+            });
+        }
     }
 
     Ok(quote! {
