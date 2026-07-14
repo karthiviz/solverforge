@@ -10,8 +10,9 @@ use solverforge_core::domain::PlanningSolution;
 use solverforge_scoring::Director;
 
 use super::{
-    KOptMove, ListChangeMove, ListMultiSwapMove, ListPermuteMove, ListReverseMove, ListRuinMove,
-    ListSwapMove, Move, MoveTabuSignature, SublistChangeMove, SublistSwapMove,
+    FamilyBlockMove, KOptMove, ListChangeMove, ListMultiSwapMove, ListPermuteMove,
+    ListReverseMove, ListRuinMove, ListSwapMove, Move, MoveTabuSignature, SublistChangeMove,
+    SublistSwapMove,
 };
 
 /// A monomorphized union of all list-variable move types.
@@ -38,6 +39,7 @@ pub enum ListMoveUnion<S, V> {
     ListReverse(ListReverseMove<S, V>),
     KOpt(KOptMove<S, V>),
     ListRuin(ListRuinMove<S, V>),
+    FamilyBlock(FamilyBlockMove<S, V>),
 }
 
 pub enum ListMoveUnionUndo<S, V>
@@ -54,6 +56,7 @@ where
     ListReverse(<ListReverseMove<S, V> as Move<S>>::Undo),
     KOpt(<KOptMove<S, V> as Move<S>>::Undo),
     ListRuin(<ListRuinMove<S, V> as Move<S>>::Undo),
+    FamilyBlock(<FamilyBlockMove<S, V> as Move<S>>::Undo),
 }
 
 impl<S, V> Clone for ListMoveUnion<S, V>
@@ -72,6 +75,7 @@ where
             Self::ListReverse(m) => Self::ListReverse(*m),
             Self::KOpt(m) => Self::KOpt(m.clone()),
             Self::ListRuin(m) => Self::ListRuin(m.clone()),
+            Self::FamilyBlock(m) => Self::FamilyBlock(*m),
         }
     }
 }
@@ -92,6 +96,7 @@ where
             Self::ListReverse(m) => m.fmt(f),
             Self::KOpt(m) => m.fmt(f),
             Self::ListRuin(m) => m.fmt(f),
+            Self::FamilyBlock(m) => m.fmt(f),
         }
     }
 }
@@ -114,6 +119,7 @@ where
             Self::ListReverse(m) => m.is_doable(score_director),
             Self::KOpt(m) => m.is_doable(score_director),
             Self::ListRuin(m) => m.is_doable(score_director),
+            Self::FamilyBlock(m) => m.is_doable(score_director),
         }
     }
 
@@ -146,6 +152,10 @@ where
             }
             Self::KOpt(m) => ListMoveUnionUndo::KOpt(m.do_move(score_director)),
             Self::ListRuin(m) => ListMoveUnionUndo::ListRuin(m.do_move(score_director)),
+            Self::FamilyBlock(m) => {
+                m.do_move(score_director);
+                ListMoveUnionUndo::FamilyBlock(())
+            }
         }
     }
 
@@ -176,6 +186,9 @@ where
             (Self::ListRuin(m), ListMoveUnionUndo::ListRuin(undo)) => {
                 m.undo_move(score_director, undo)
             }
+            (Self::FamilyBlock(m), ListMoveUnionUndo::FamilyBlock(undo)) => {
+                m.undo_move(score_director, undo)
+            }
             _ => panic!("list move undo shape must match move shape"),
         }
     }
@@ -191,6 +204,7 @@ where
             Self::ListReverse(m) => m.descriptor_index(),
             Self::KOpt(m) => m.descriptor_index(),
             Self::ListRuin(m) => m.descriptor_index(),
+            Self::FamilyBlock(m) => m.descriptor_index(),
         }
     }
 
@@ -205,6 +219,7 @@ where
             Self::ListReverse(m) => m.entity_indices(),
             Self::KOpt(m) => m.entity_indices(),
             Self::ListRuin(m) => m.entity_indices(),
+            Self::FamilyBlock(m) => m.entity_indices(),
         }
     }
 
@@ -219,6 +234,7 @@ where
             Self::ListReverse(m) => m.variable_name(),
             Self::KOpt(m) => m.variable_name(),
             Self::ListRuin(m) => m.variable_name(),
+            Self::FamilyBlock(m) => m.variable_name(),
         }
     }
 
@@ -233,6 +249,7 @@ where
             Self::ListReverse(m) => m.telemetry_label(),
             Self::KOpt(m) => m.telemetry_label(),
             Self::ListRuin(m) => m.telemetry_label(),
+            Self::FamilyBlock(m) => m.telemetry_label(),
         }
     }
 
@@ -247,6 +264,7 @@ where
             Self::ListReverse(m) => m.requires_hard_improvement(),
             Self::KOpt(m) => m.requires_hard_improvement(),
             Self::ListRuin(m) => m.requires_hard_improvement(),
+            Self::FamilyBlock(m) => m.requires_hard_improvement(),
         }
     }
 
@@ -261,6 +279,7 @@ where
             Self::ListReverse(m) => m.requires_score_improvement(),
             Self::KOpt(m) => m.requires_score_improvement(),
             Self::ListRuin(m) => m.requires_score_improvement(),
+            Self::FamilyBlock(m) => m.requires_score_improvement(),
         }
     }
 
@@ -275,6 +294,7 @@ where
             Self::ListReverse(m) => m.tabu_signature(score_director),
             Self::KOpt(m) => m.tabu_signature(score_director),
             Self::ListRuin(m) => m.tabu_signature(score_director),
+            Self::FamilyBlock(m) => m.tabu_signature(score_director),
         }
     }
 }

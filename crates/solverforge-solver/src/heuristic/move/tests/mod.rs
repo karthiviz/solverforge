@@ -119,6 +119,7 @@ mod arena;
 mod change;
 mod compound_scalar;
 mod conflict_repair;
+mod family_block;
 mod k_opt;
 mod list_change;
 mod list_multi_swap;

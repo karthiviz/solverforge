@@ -61,6 +61,7 @@ mod compound_scalar;
 mod conflict_repair;
 mod dynamic_list_change;
 mod dynamic_scalar_change;
+mod family_block;
 mod k_opt;
 pub mod k_opt_reconnection;
 mod list_change;
@@ -95,6 +96,7 @@ pub use compound_scalar::{CompoundScalarEdit, CompoundScalarMove, COMPOUND_SCALA
 pub use conflict_repair::{ConflictRepairMove, ConflictRepairScalarEdit};
 pub use dynamic_list_change::DynamicListChangeMove;
 pub use dynamic_scalar_change::DynamicScalarChangeMove;
+pub use family_block::FamilyBlockMove;
 pub use k_opt::{CutPoint, KOptMove};
 pub use list_change::ListChangeMove;
 pub use list_multi_swap::ListMultiSwapMove;
